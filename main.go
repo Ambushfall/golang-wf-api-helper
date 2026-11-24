@@ -20,23 +20,30 @@ import (
 )
 
 var (
-	authzPattern    = regexp.MustCompile(`\?accountId=([0-9a-fA-F]{24})&nonce=(\d+)`)
-	errUnauthorized = errors.New("session unauthorized or expired")
+	authzPattern          = regexp.MustCompile(`\?accountId=([0-9a-fA-F]{24})&nonce=(\d+)`)
+	errUnauthorized       = errors.New("session unauthorized or expired")
+	errWarframeNotRunning = errors.New("warframe process not running")
 )
 
 type ServiceConfig struct {
 	Interval       time.Duration
-	MaxFailureTime time.Duration
-	InitialBackoff time.Duration
-	MaxBackoff     time.Duration
+	ProcessPoll    time.Duration
+	WaitForProcess bool
 	OutputDir      string
+}
+
+type cachedSession struct {
+	pid   uint32
+	addr  uintptr
+	authz string
 }
 
 type InventoryService struct {
 	cfg    ServiceConfig
 	client *http.Client
-	mu     sync.Mutex
-	authz  string
+
+	mu      sync.Mutex
+	session cachedSession
 }
 
 func NewInventoryService(cfg ServiceConfig) *InventoryService {
@@ -46,80 +53,92 @@ func NewInventoryService(cfg ServiceConfig) *InventoryService {
 	}
 }
 
-func (s *InventoryService) refreshToken() error {
-	pid, err := findWarframePID()
-	if err != nil {
-		return fmt.Errorf("process lookup failed: %w", err)
+// verifyCachedSession checks that the PID hasn't changed and that the exact authz string
+// still resides at the recorded virtual address.
+func (s *InventoryService) verifyCachedSession(currentPID uint32) (string, bool) {
+	s.mu.Lock()
+	sess := s.session
+	s.mu.Unlock()
+
+	if sess.pid != currentPID || sess.addr == 0 || sess.authz == "" {
+		return "", false
 	}
 
-	candidates := make(map[string]int)
-	var found string
+	raw, err := readProcessMemoryAt(sess.pid, sess.addr, len(sess.authz))
+	if err != nil || string(raw) != sess.authz {
+		log.Println("[auth] Cached key at recorded address changed or became unreadable; rescanning...")
+		s.clearSession()
+		return "", false
+	}
 
-	err = scanProcessMemory(pid, func(chunk []byte) bool {
-		for _, match := range authzPattern.FindAllSubmatch(chunk, -1) {
-			candidate := fmt.Sprintf("?accountId=%s&nonce=%s", match[1], match[2])
+	return sess.authz, true
+}
+
+func (s *InventoryService) clearSession() {
+	s.mu.Lock()
+	s.session = cachedSession{}
+	s.mu.Unlock()
+}
+
+func (s *InventoryService) scanForSession(pid uint32) (string, error) {
+	candidates := make(map[string]int)
+	var foundAuthz string
+	var foundAddr uintptr
+
+	err := scanProcessMemory(pid, func(baseAddr uintptr, chunk []byte) bool {
+		for _, idx := range authzPattern.FindAllSubmatchIndex(chunk, -1) {
+			candidate := string(chunk[idx[0]:idx[1]])
 			candidates[candidate]++
 			if candidates[candidate] == 3 {
-				found = candidate
+				foundAuthz = candidate
+				foundAddr = baseAddr + uintptr(idx[0])
 				return true
 			}
 		}
 		return false
 	})
-
 	if err != nil {
-		return fmt.Errorf("memory scan failed: %w", err)
+		return "", fmt.Errorf("memory scan failed: %w", err)
+	}
+	if foundAuthz == "" {
+		return "", fmt.Errorf("auth token not found in process memory yet")
 	}
 
-	if found == "" {
-		return fmt.Errorf("auth token not found in process memory")
+	s.mu.Lock()
+	s.session = cachedSession{
+		pid:   pid,
+		addr:  foundAddr,
+		authz: foundAuthz,
 	}
-
-	s.mu.Lock()
-	s.authz = found
 	s.mu.Unlock()
-	log.Println("[auth] Acquired session token from Warframe process")
-	return nil
-}
 
-func (s *InventoryService) getCachedToken() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.authz
-}
-
-func (s *InventoryService) clearToken() {
-	s.mu.Lock()
-	s.authz = ""
-	s.mu.Unlock()
+	log.Printf("[auth] Acquired session token at 0x%x (PID %d)", foundAddr, pid)
+	return foundAuthz, nil
 }
 
 func (s *InventoryService) fetchAndSave(ctx context.Context, authz string) error {
 	req, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodGet,
-		"https://mobile.warframe.com/api/inventory.php"+authz,
+		"https://api.warframe.com/api/inventory.php"+authz,
 		nil,
 	)
 	if err != nil {
 		return err
 	}
+	req.Header.Set("User-Agent", "Warframe/1.0")
 
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("http request failed: %w", err)
 	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			fmt.Printf("Failed closing response body: %v\n", err)
-		}
-	}()
+	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusConflict {
+	if resp.StatusCode == http.StatusUnauthorized ||
+		resp.StatusCode == http.StatusForbidden ||
+		resp.StatusCode == http.StatusConflict {
 		return errUnauthorized
 	}
-
-	// Јебеш га сад, ко зна који му је курац..
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected HTTP status %d", resp.StatusCode)
 	}
@@ -154,60 +173,81 @@ func (s *InventoryService) fetchAndSave(ctx context.Context, authz string) error
 	return nil
 }
 
-// токен .. грешка .. освежи
-func (s *InventoryService) syncAttempt(ctx context.Context) error {
-	token := s.getCachedToken()
-	if token == "" {
-		if err := s.refreshToken(); err != nil {
-			return err
-		}
-		token = s.getCachedToken()
+// syncOnce verifies the cached address (or scans if missing/changed) and performs a single fetch.
+// On 401/403/409, it performs at most one fresh scan + retry before waiting for the next interval.
+func (s *InventoryService) syncOnce(ctx context.Context) error {
+	pid, err := findWarframePID()
+	if err != nil {
+		s.clearSession()
+		return errWarframeNotRunning
 	}
 
-	err := s.fetchAndSave(ctx, token)
+	authz, ok := s.verifyCachedSession(pid)
+	if !ok {
+		authz, err = s.scanForSession(pid)
+		if err != nil {
+			// Game is running (e.g. still on login screen) — skip API call until next interval
+			log.Printf("[sync] Skipping fetch: %v", err)
+			return nil
+		}
+	}
+
+	err = s.fetchAndSave(ctx, authz)
 	if errors.Is(err, errUnauthorized) {
-		log.Println("[sync] Permission/session rejected (401/403), refreshing token and retrying...")
-		s.clearToken()
-		if err := s.refreshToken(); err != nil {
-			return err
+		log.Println("[sync] Session rejected by API, rescanning once...")
+		s.clearSession()
+		freshAuthz, scanErr := s.scanForSession(pid)
+		if scanErr != nil {
+			log.Printf("[sync] Rescan failed: %v", scanErr)
+			return nil
 		}
-		return s.fetchAndSave(ctx, s.getCachedToken())
+		if retryErr := s.fetchAndSave(ctx, freshAuthz); retryErr != nil {
+			log.Printf("[sync] Fetch after rescan failed: %v", retryErr)
+			return nil
+		}
+		log.Println("[sync] Inventory updated (inventory.json)")
+		return nil
 	}
 
-	return err
+	if err != nil {
+		log.Printf("[sync] Fetch failed: %v", err)
+		return nil
+	}
+
+	log.Println("[sync] Inventory updated (inventory.json)")
+	return nil
 }
 
-// Нећемо да издркавамо, букв одјебемо што пре да не би попили банану
-func (s *InventoryService) syncWithBackoff(ctx context.Context) error {
-	deadline := time.Now().Add(s.cfg.MaxFailureTime)
-	backoff := s.cfg.InitialBackoff
+func (s *InventoryService) waitForWarframe(ctx context.Context) error {
+	log.Printf("[service] Waiting for Warframe process (checking every %s)...", s.cfg.ProcessPoll)
+	ticker := time.NewTicker(s.cfg.ProcessPoll)
+	defer ticker.Stop()
 
-	for attempt := 1; ; attempt++ {
-		err := s.syncAttempt(ctx)
-		if err == nil {
-			log.Println("[sync] Inventory updated (inventory.json)")
+	for {
+		if _, err := findWarframePID(); err == nil {
+			log.Println("[service] Warframe process detected")
 			return nil
 		}
 
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return fmt.Errorf("sync failed continuously for %s (last error: %w)", s.cfg.MaxFailureTime, err)
-		}
-
-		wait := min(backoff, remaining)
-		log.Printf("[sync] Attempt %d failed: %v — retrying in %s (timeout in %s)",
-			attempt, err, wait.Round(time.Second), remaining.Round(time.Second))
-
-		if !sleepCtx(ctx, wait) {
+		select {
+		case <-ctx.Done():
 			return ctx.Err()
+		case <-ticker.C:
 		}
-
-		backoff = min(backoff*2, s.cfg.MaxBackoff)
 	}
 }
 
 func (s *InventoryService) Run(ctx context.Context) error {
-	if err := s.syncWithBackoff(ctx); err != nil {
+	if _, err := findWarframePID(); err != nil {
+		if !s.cfg.WaitForProcess {
+			return errWarframeNotRunning
+		}
+		if err := s.waitForWarframe(ctx); err != nil {
+			return err
+		}
+	}
+
+	if err := s.syncOnce(ctx); errors.Is(err, errWarframeNotRunning) && !s.cfg.WaitForProcess {
 		return err
 	}
 
@@ -219,46 +259,65 @@ func (s *InventoryService) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if err := s.syncWithBackoff(ctx); err != nil {
-				return err
+			err := s.syncOnce(ctx)
+			if errors.Is(err, errWarframeNotRunning) {
+				if !s.cfg.WaitForProcess {
+					return err
+				}
+				if err := s.waitForWarframe(ctx); err != nil {
+					return err
+				}
+				_ = s.syncOnce(ctx)
 			}
 		}
 	}
 }
 
-func sleepCtx(ctx context.Context, d time.Duration) bool {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-t.C:
-		return true
-	}
-}
-
 func main() {
 	interval := flag.Duration("interval", 5*time.Minute, "Inventory refresh interval (e.g. 30s, 2m, 5m)")
-	maxFail := flag.Duration("max-fail", 10*time.Minute, "Exit with error after failing continuously for this duration")
+	wait := flag.Bool("wait", false, "Wait for Warframe to start/restart instead of exiting early when not running")
+	poll := flag.Duration("poll", 10*time.Second, "Process check interval when -wait is enabled")
 	outDir := flag.String("out", ".", "Directory to write inventory.json")
+	version := flag.Bool("version", false, "Print version information and exit")
+
+	flag.Usage = func() {
+		out := flag.CommandLine.Output()
+		bin := filepath.Base(os.Args[0])
+		fmt.Fprintf(out, "warframe-api-helper — Periodic Warframe inventory sync service\n\n")
+		fmt.Fprintf(out, "Usage:\n  %s [flags]\n\n", bin)
+		fmt.Fprintf(out, "Flags:\n")
+		flag.PrintDefaults()
+		fmt.Fprintf(out, "\nExamples:\n")
+		fmt.Fprintf(out, "  %s -interval 3m -out ./data\n", bin)
+		fmt.Fprintf(out, "  %s -wait -interval 5m -poll 15s\n\n", bin)
+		fmt.Fprintf(out, "Exit Codes:\n")
+		fmt.Fprintf(out, "  0  Clean shutdown (SIGINT / SIGTERM)\n")
+		fmt.Fprintf(out, "  1  Warframe process not running (when -wait is false)\n")
+		fmt.Fprintf(out, "  2  Invalid CLI flags\n")
+	}
+
 	flag.Parse()
+
+	if *version {
+		fmt.Println("warframe-api-helper v0.2.0")
+		os.Exit(0)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	svc := NewInventoryService(ServiceConfig{
 		Interval:       *interval,
-		MaxFailureTime: *maxFail,
-		InitialBackoff: 5 * time.Second,
-		MaxBackoff:     1 * time.Minute,
+		ProcessPoll:    *poll,
+		WaitForProcess: *wait,
 		OutputDir:      *outDir,
 	})
 
-	log.Printf("[service] Starting Warframe inventory sync (interval=%s, max-fail=%s, out=%s)",
-		*interval, *maxFail, *outDir)
+	log.Printf("[service] Starting Warframe inventory sync (interval=%s, wait=%v, out=%s)",
+		*interval, *wait, *outDir)
 
 	if err := svc.Run(ctx); err != nil {
-		log.Printf("[service] Fatal error: %v", err)
+		log.Printf("[service] Exiting: %v", err)
 		os.Exit(1)
 	}
 

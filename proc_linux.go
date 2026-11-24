@@ -12,12 +12,15 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+const (
+	scanChunkSize   = 4 * 1024 * 1024
+	scanOverlapSize = 128
+)
+
 type memoryAllocation struct {
 	start uintptr
 	size  uintptr
 }
-
-// за све педере, први коментар је због да ми сисаш кару.
 
 func findWarframePID() (uint32, error) {
 	entries, err := os.ReadDir("/proc")
@@ -25,10 +28,11 @@ func findWarframePID() (uint32, error) {
 		return 0, err
 	}
 
-	// Гледали смо Синана и његов фазон, копи пејст и клауд
 	for _, target := range []string{"Warframe.x64.exe", "Warframe.x64.ex"} {
 		for _, entry := range entries {
-
+			if !entry.IsDir() {
+				continue
+			}
 			pid, err := strconv.ParseUint(entry.Name(), 10, 32)
 			if err != nil {
 				continue
@@ -40,8 +44,9 @@ func findWarframePID() (uint32, error) {
 			}
 
 			cmdlineBytes, _ := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
-			for _, arg := range strings.Split(string(cmdlineBytes), "\x00") {
-				if strings.EqualFold(filepath.Base(strings.ReplaceAll(arg, "\\", "/")), target) {
+			if len(cmdlineBytes) > 0 {
+				argv0 := strings.SplitN(string(cmdlineBytes), "\x00", 2)[0]
+				if strings.EqualFold(filepath.Base(strings.ReplaceAll(argv0, "\\", "/")), target) {
 					return uint32(pid), nil
 				}
 			}
@@ -51,7 +56,6 @@ func findWarframePID() (uint32, error) {
 	return 0, fmt.Errorf("process not found")
 }
 
-// исто копи паста
 func getAllocations(pid uint32) ([]memoryAllocation, error) {
 	mapsPath := fmt.Sprintf("/proc/%d/maps", pid)
 	mapsData, err := os.ReadFile(mapsPath)
@@ -66,7 +70,6 @@ func getAllocations(pid uint32) ([]memoryAllocation, error) {
 			continue
 		}
 
-		// немамо кондом спреман...
 		if len(fields) >= 6 && (fields[5] == "[vvar]" || fields[5] == "[vdso]" || fields[5] == "[vsyscall]") {
 			continue
 		}
@@ -91,7 +94,6 @@ func getAllocations(pid uint32) ([]memoryAllocation, error) {
 	return allocs, nil
 }
 
-// опет копипаста, неампојма јел ради уопште, мрзи ме да палим арч
 func externalRead(pid uint32, addr uintptr, buf []byte) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
@@ -107,8 +109,22 @@ func externalRead(pid uint32, addr uintptr, buf []byte) (int, error) {
 	return unix.ProcessVMReadv(int(pid), localIov, remoteIov, 0)
 }
 
-// овде је клауд скувао ручак и вечеру
-func scanProcessMemory(pid uint32, onChunk func([]byte) bool) error {
+// readProcessMemoryAt reads an exact number of bytes at a known virtual address.
+func readProcessMemoryAt(pid uint32, addr uintptr, size int) ([]byte, error) {
+	if size <= 0 {
+		return nil, nil
+	}
+	buf := make([]byte, size)
+	n, err := externalRead(pid, addr, buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf[:n], nil
+}
+
+// scanProcessMemory streams readable memory regions through a fixed 4 MB buffer
+// and passes each chunk's starting virtual address to onChunk.
+func scanProcessMemory(pid uint32, onChunk func(baseAddr uintptr, chunk []byte) bool) error {
 	allocs, err := getAllocations(pid)
 	if err != nil {
 		return fmt.Errorf("failed to open process: %w", err)
@@ -121,14 +137,33 @@ func scanProcessMemory(pid uint32, onChunk func([]byte) bool) error {
 		}
 	}
 
+	buf := make([]byte, scanChunkSize+scanOverlapSize)
+
 	for _, ai := range allocs {
-		buf := make([]byte, ai.size)
-		n, err := externalRead(pid, ai.start, buf)
-		if err != nil || n <= 0 {
-			continue
-		}
-		if onChunk(buf[:n]) {
-			return nil
+		var offset uintptr
+		carry := 0
+
+		for offset < ai.size {
+			toRead := min(ai.size-offset, uintptr(len(buf)-carry))
+			n, readErr := externalRead(pid, ai.start+offset, buf[carry:carry+int(toRead)])
+			if readErr != nil || n <= 0 {
+				break
+			}
+
+			total := carry + n
+			chunkBase := ai.start + offset - uintptr(carry)
+			if onChunk(chunkBase, buf[:total]) {
+				return nil
+			}
+
+			if offset+uintptr(n) >= ai.size {
+				break
+			}
+
+			keep := min(total, scanOverlapSize)
+			copy(buf[:keep], buf[total-keep:total])
+			carry = keep
+			offset += uintptr(n)
 		}
 	}
 

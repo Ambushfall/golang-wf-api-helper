@@ -12,8 +12,6 @@ package_name=${package_split[-1]}
 platforms=(
 "windows/amd64" # Windows AMD 64 bit
 "linux/amd64" # Linux running AMD 64 Bit
-"darwin/arm64" # Mac Silicon M1 ARM
-"darwin/amd64" # MacOS AMD 64 BIT < Буквално ме боли курац, као ради аха како да не, знаш кад
 )
 
 if [[ -n "$all" && "$all" == "ALL" ]]; then
